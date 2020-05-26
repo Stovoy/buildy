@@ -1,9 +1,9 @@
 use crossbeam;
-use crossbeam::channel::{unbounded, Receiver, SendError, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, SendError, TryRecvError, channel};
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 use duct::cmd;
-use notify::{RawEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{DebouncedEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env::current_dir;
@@ -13,6 +13,9 @@ use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 use walkdir::WalkDir;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use duct::unix::HandleExt;
 
 fn main() -> Result<(), String> {
     let file_name = ".buildy.yml";
@@ -53,10 +56,11 @@ impl fmt::Display for SanityCheckError<'_> {
 
 enum BuildLoopError<'a> {
     BuildFailed(&'a String),
-    UnspecifiedCrossbeamError,
-    CrossbeamSendError(SendError<RunSignal>),
-    CrossbeamRecvError(TryRecvError),
-    WatcherError(notify::Error),
+    UnspecifiedChannelError,
+    SendError(SendError<RunSignal>),
+    RecvError(TryRecvError),
+    WatcherSetupError(notify::Error),
+    WatcherPathError(&'a String, notify::Error),
     CwdIOError(std::io::Error),
     CwdUtf8Error,
 }
@@ -65,19 +69,22 @@ impl fmt::Display for BuildLoopError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BuildLoopError::BuildFailed(target) => write!(f, "Build failed for target {}", target),
-            BuildLoopError::UnspecifiedCrossbeamError => {
-                write!(f, "Unknown crossbeam parllelism failure")
+            BuildLoopError::UnspecifiedChannelError => {
+                write!(f, "Unknown channel parllelism failure")
             }
-            BuildLoopError::CrossbeamSendError(send_err) => write!(
+            BuildLoopError::SendError(send_err) => write!(
                 f,
                 "Failed to send run signal '{}' to running process",
                 send_err.0
             ),
-            BuildLoopError::CrossbeamRecvError(recv_err) => {
-                write!(f, "Crossbeam parallelism failure: {}", recv_err)
+            BuildLoopError::RecvError(recv_err) => {
+                write!(f, "Channel receive failure: {}", recv_err)
             }
-            BuildLoopError::WatcherError(notify_err) => {
-                write!(f, "File watch error: {}", notify_err)
+            BuildLoopError::WatcherSetupError(notify_err) => {
+                write!(f, "Watcher setup error: {}", notify_err)
+            }
+            BuildLoopError::WatcherPathError(path, notify_err) => {
+                write!(f, "File watch error: {}: {}", path, notify_err)
             }
             BuildLoopError::CwdIOError(io_err) => {
                 write!(f, "IO Error while getting current directory: {}", io_err)
@@ -135,6 +142,36 @@ impl Builder {
         Ok(())
     }
 
+    fn process_path_change<'a>(
+        &'a self,
+        path: PathBuf,
+        working_dir: &str,
+        has_changed_files: &mut HashSet<&'a String>,
+    ) {
+        let absolute_path = match path.to_str() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // TODO: This won't work with symlinks.
+        let relative_path = &absolute_path[working_dir.len() + 1..];
+
+        for (target_name, target) in self.targets.iter() {
+            if relative_path.ends_with("~") {
+                // Exclude files ending in ~ (generally temporary files)
+                // TODO: Make this configurable.
+                continue;
+            }
+            if target
+                .watch_list
+                .iter()
+                .any(|watch_path| relative_path.starts_with(watch_path))
+            {
+                has_changed_files.insert(target_name);
+            }
+        }
+    }
+
     fn choose_build_targets<'a>(
         &'a self,
         built_targets: &mut HashSet<&'a String>,
@@ -183,42 +220,41 @@ impl Builder {
             let mut built_targets = HashSet::new();
             let mut building = HashSet::new();
 
-            let (tx, rx) = unbounded();
+            let (tx, rx) = channel();
             let working_dir = current_dir().map_err(BuildLoopError::CwdIOError)?;
             let working_dir = working_dir
                 .to_str()
                 .ok_or_else(|| BuildLoopError::CwdUtf8Error)?;
 
-            let mut run_tx_channels: HashMap<&String, Sender<RunSignal>> = Default::default();
+            let run_tx_channels: Arc<Mutex<HashMap<&String, Sender<RunSignal>>>> = Default::default();
 
             loop {
                 match watcher_rx.try_recv() {
                     Ok(result) => {
-                        let absolute_path = match result.path {
-                            Some(path) => path,
-                            None => continue,
-                        };
-                        let absolute_path = match absolute_path.to_str() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-
-                        // TODO: This won't work with symlinks.
-                        let relative_path = &absolute_path[working_dir.len() + 1..];
-
-                        for (target_name, target) in self.targets.iter() {
-                            if target
-                                .watch_list
-                                .iter()
-                                .any(|watch_path| relative_path.starts_with(watch_path))
-                            {
-                                has_changed_files.insert(target_name);
+                        match result {
+                            DebouncedEvent::Create(path) |
+                            DebouncedEvent::Write(path) |
+                            DebouncedEvent::Chmod(path) |
+                            DebouncedEvent::Remove(path) => {
+                                self.process_path_change(path, working_dir, &mut has_changed_files)
                             }
+                            DebouncedEvent::Rename(path_before, path_after) => {
+                                self.process_path_change(path_before, working_dir, &mut has_changed_files);
+                                self.process_path_change(path_after, working_dir, &mut has_changed_files);
+                            }
+                            DebouncedEvent::Error(e, path) => match path {
+                                None => println!("Watcher error {}", e),
+                                Some(path) => match path.to_str() {
+                                    None => println!("Watcher error {}", e),
+                                    Some(path) => println!("Watcher error at \"{}\": {}", path, e)
+                                },
+                            },
+                            _ => {}
                         }
                     }
                     Err(e) => match e {
                         TryRecvError::Empty => {}
-                        _ => return Err(BuildLoopError::CrossbeamRecvError(e)),
+                        _ => return Err(BuildLoopError::RecvError(e)),
                     },
                 }
 
@@ -236,7 +272,6 @@ impl Builder {
 
                 for target_to_build in to_build.iter() {
                     let target_to_build = target_to_build.clone();
-                    println!("Building {}", target_to_build);
                     building.insert(target_to_build);
                     has_changed_files.remove(&target_to_build);
                     let tx_clone = tx.clone();
@@ -251,25 +286,33 @@ impl Builder {
 
                         let target = self.targets.get(result.target).unwrap().clone();
 
-                        // If already running, send a kill signal.
-                        match run_tx_channels.get(result.target) {
-                            None => {}
-                            Some(run_tx) => run_tx
-                                .send(RunSignal::Kill)
-                                .map_err(BuildLoopError::CrossbeamSendError)?,
-                        }
-
                         if !target.run_list.is_empty() {
-                            let (run_tx, run_rx) = unbounded();
-                            run_tx_channels.insert(result.target, run_tx);
+                            // If already running, send a kill signal.
+                            match run_tx_channels.lock().unwrap().get(result.target) {
+                                None => {}
+                                Some(run_tx) => run_tx
+                                    .send(RunSignal::Kill)
+                                    .map_err(BuildLoopError::SendError)?,
+                            }
 
-                            let tx_clone = tx.clone();
-                            scope.spawn(move |_| target.run(tx_clone, run_rx).unwrap());
+                            let (run_tx, run_rx) = channel();
+
+                            let run_tx_channels = run_tx_channels.clone();
+                            println!("Running {}", result.target);
+                            scope.spawn(move |_| {
+                                // Wait for it to be killed.
+                                while run_tx_channels.lock().unwrap().contains_key(result.target) {
+                                    sleep(Duration::from_millis(10));
+                                }
+                                run_tx_channels.lock().unwrap().insert(result.target, run_tx);
+                                target.run(run_rx).unwrap();
+                                run_tx_channels.lock().unwrap().remove(result.target);
+                            });
                         }
                     }
                     Err(e) => {
                         if e != TryRecvError::Empty {
-                            return Err(BuildLoopError::CrossbeamRecvError(e));
+                            return Err(BuildLoopError::RecvError(e));
                         }
                     }
                 }
@@ -277,20 +320,20 @@ impl Builder {
                 sleep(Duration::from_millis(10))
             }
         })
-        .map_err(|_| BuildLoopError::UnspecifiedCrossbeamError)
-        .and_then(|r| r)?;
+            .map_err(|_| BuildLoopError::UnspecifiedChannelError)
+            .and_then(|r| r)?;
         Ok(())
     }
 
-    fn setup_watcher(&self) -> Result<(RecommendedWatcher, Receiver<RawEvent>), BuildLoopError> {
-        let (watcher_tx, watcher_rx) = unbounded();
+    fn setup_watcher(&self) -> Result<(RecommendedWatcher, std::sync::mpsc::Receiver<DebouncedEvent>), BuildLoopError> {
+        let (watcher_tx, watcher_rx) = channel();
         let mut watcher: RecommendedWatcher =
-            Watcher::new_immediate(watcher_tx).map_err(BuildLoopError::WatcherError)?;
+            Watcher::new(watcher_tx, Duration::from_secs(0)).map_err(BuildLoopError::WatcherSetupError)?;
         for target in self.targets.values() {
             for watch_path in target.watch_list.iter() {
                 watcher
                     .watch(watch_path, RecursiveMode::Recursive)
-                    .map_err(BuildLoopError::WatcherError)?;
+                    .map_err(|e| BuildLoopError::WatcherPathError(watch_path, e))?;
             }
         }
 
@@ -305,14 +348,14 @@ impl Builder {
     ) -> Result<(), BuildLoopError> {
         match result.state {
             BuildResultState::Success => {
-                println!("DONE {}:\n{}", result.target, result.output);
+                if result.output != "" {
+                    println!("Built {}:\n{}", result.target, result.output);
+                }
             }
             BuildResultState::Fail => {
                 return Err(BuildLoopError::BuildFailed(result.target));
             }
-            BuildResultState::Skip => {
-                println!("SKIP (Not Modified) {}:\n{}", result.target, result.output);
-            }
+            BuildResultState::Skip => {}
         }
         building.remove(result.target);
         built_targets.insert(result.target);
@@ -365,17 +408,16 @@ impl Target {
                     state: BuildResultState::Skip,
                     output: output_string,
                 })
-                .map_err(|e| format!("Sender error: {}", e))?;
+                  .map_err(|e| format!("Sender error: {}", e))?;
                 return Ok(());
             }
             write_checksum(name, &watch_checksum)?;
         }
 
+        println!("Building {}", name);
         for command in self.build_list.iter() {
-            println!("Running build command: {}", command);
             match cmd!("/bin/sh", "-c", command).stderr_to_stdout().run() {
                 Ok(output) => {
-                    println!("Ok {}", command);
                     output_string.push_str(
                         String::from_utf8(output.stdout)
                             .map_err(|e| format!("Failed to interpret stdout as utf-8: {}", e))?
@@ -383,13 +425,13 @@ impl Target {
                     );
                 }
                 Err(e) => {
-                    println!("Err {} {}", e, command);
+                    println!("Error running \"{}\": {}", e, command);
                     tx.send(BuildResult {
                         target: name,
                         state: BuildResultState::Fail,
                         output: output_string,
                     })
-                    .map_err(|e| format!("Sender error: {}", e))?;
+                      .map_err(|e| format!("Sender error: {}", e))?;
                     return Ok(());
                 }
             }
@@ -400,26 +442,26 @@ impl Target {
             state: BuildResultState::Success,
             output: output_string,
         })
-        .map_err(|e| format!("Sender error: {}", e))?;
+          .map_err(|e| format!("Sender error: {}", e))?;
         Ok(())
     }
 
-    fn run(&self, _tx: Sender<BuildResult>, rx: Receiver<RunSignal>) -> Result<(), String> {
+    fn run(&self, rx: Receiver<RunSignal>) -> Result<(), String> {
         for command in self.run_list.iter() {
-            println!("Running command: {}", command);
             let handle = cmd!("/bin/sh", "-c", command)
                 .stderr_to_stdout()
                 .start()
                 .map_err(|e| format!("Failed to run command {}: {}", command, e))?;
-            loop {
-                match rx.recv() {
-                    Ok(RunSignal::Kill) => {
-                        return handle
-                            .kill()
-                            .map_err(|e| format!("Failed to kill process {}: {}", command, e))
-                    }
-                    Err(e) => return Err(format!("Receiver error: {}", e)),
+            match rx.recv() {
+                Ok(RunSignal::Kill) => {
+                    let sigterm = 15;
+                    return handle.send_signal(sigterm).map_err(|e| {
+                        let result = format!("Failed to kill process {}: {}", command, e);
+                        println!("{}", result);
+                        result
+                    });
                 }
+                Err(e) => return Err(format!("Receiver error: {}", e)),
             }
         }
         Ok(())
