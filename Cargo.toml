@@ -1,6 +1,6 @@
 [package]
 name = "buildy"
-version = "0.0.9"
+version = "0.10.0"
 authors = ["Steve Mostovoy <stevemostovoysm@gmail.com>"]
 edition = "2018"
 

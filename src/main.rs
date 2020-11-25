@@ -15,7 +15,6 @@ use std::time::Duration;
 use walkdir::WalkDir;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use duct::unix::HandleExt;
 
 fn main() -> Result<(), String> {
     let file_name = ".buildy.yml";
@@ -495,12 +494,14 @@ impl Target {
                 .map_err(|e| format!("Failed to run command {}: {}", command, e))?;
             match rx.recv() {
                 Ok(RunSignal::Kill) => {
-                    let sigterm = 15;
-                    return handle.send_signal(sigterm).map_err(|e| {
+                    let kill_command = "kill ".to_owned() + &handle.pids().iter().map(|x| format!("{}", x))
+                        .collect::<Vec<String>>()
+                        .join(" ");
+                    cmd!("/bin/sh", "-c", kill_command).start().map_err(|e| {
                         let result = format!("Failed to kill process {}: {}", command, e);
                         println!("{}", result);
                         result
-                    });
+                    })?;
                 }
                 Err(e) => return Err(format!("Receiver error: {}", e)),
             }
