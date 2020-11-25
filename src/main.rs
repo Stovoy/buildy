@@ -146,7 +146,7 @@ impl Builder {
         &'a self,
         path: PathBuf,
         working_dir: &str,
-        has_changed_files: &mut HashSet<&'a String>,
+        has_changed_files: &mut Vec<(&'a String, &'a String)>,
     ) {
         let absolute_path = match path.to_str() {
             Some(s) => s,
@@ -162,12 +162,11 @@ impl Builder {
                 // TODO: Make this configurable.
                 continue;
             }
-            if target
-                .watch_list
-                .iter()
-                .any(|watch_path| relative_path.starts_with(watch_path))
-            {
-                has_changed_files.insert(target_name);
+            for watch_path in target.watch_list.iter() {
+                let new_item = (target_name, watch_path);
+                if relative_path.starts_with(watch_path) && !has_changed_files.contains(&new_item) {
+                    has_changed_files.push(new_item);
+                }
             }
         }
     }
@@ -176,7 +175,7 @@ impl Builder {
         &'a self,
         built_targets: &mut HashSet<&'a String>,
         building: &mut HashSet<&'a String>,
-        has_changed_files: &mut HashSet<&'a String>,
+        has_changed_files: &mut Vec<(&'a String, &'a String)>,
         to_build: &mut HashSet<&'a String>,
     ) {
         for (target_name, target) in self.targets.iter() {
@@ -188,14 +187,29 @@ impl Builder {
             if !dependencies_satisfied {
                 continue;
             }
+
             if building.contains(target_name) {
                 continue;
             }
+
             if built_targets.contains(target_name) {
                 if !target.run_options.incremental {
                     continue;
                 }
-                if !has_changed_files.contains(target_name) {
+
+                let mut has_matching_target = false;
+
+                // We don't skip if target name is in the list
+                // and it's not in the non incremental list.
+
+                for (t, watch_path) in has_changed_files.iter() {
+                    if *t == target_name && !target.run_options.watch_path_options
+                                                   .non_incremental_list.contains(watch_path) {
+                        has_matching_target = true;
+                    }
+                }
+
+                if !has_matching_target {
                     continue;
                 }
             }
@@ -216,7 +230,7 @@ impl Builder {
             let (_watcher, watcher_rx) = self.setup_watcher()?;
 
             let mut to_build = HashSet::new();
-            let mut has_changed_files = HashSet::new();
+            let mut has_changed_files = Vec::new();
             let mut built_targets = HashSet::new();
             let mut building = HashSet::new();
 
@@ -273,7 +287,16 @@ impl Builder {
                 for target_to_build in to_build.iter() {
                     let target_to_build = target_to_build.clone();
                     building.insert(target_to_build);
-                    has_changed_files.remove(&target_to_build);
+
+                    let mut i = 0;
+                    while i != has_changed_files.len() {
+                        if has_changed_files[i].0 == target_to_build {
+                            has_changed_files.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+
                     let tx_clone = tx.clone();
                     let target = self.targets.get(target_to_build).unwrap().clone();
                     scope.spawn(move |_| target.build(&target_to_build, tx_clone));
@@ -377,15 +400,33 @@ struct Target {
     run_options: RunOptions,
 }
 
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct RunOptions {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     incremental: bool,
+    watch_path_options: WatchPathOptions,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        RunOptions { incremental: true }
+        RunOptions { incremental: true, watch_path_options: WatchPathOptions::default() }
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+struct WatchPathOptions {
+    #[serde(default, rename = "non_incremental")]
+    non_incremental_list: Vec<String>,
+}
+
+impl Default for WatchPathOptions {
+    fn default() -> Self {
+        WatchPathOptions { non_incremental_list: Vec::new() }
     }
 }
 
