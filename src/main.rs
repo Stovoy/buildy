@@ -456,7 +456,7 @@ impl Target {
 
         println!("Building {}", name);
         for command in self.build_list.iter() {
-            match cmd!("/bin/sh", "-c", command).stderr_to_stdout().run() {
+            match cmd!("sh", "-c", command).stderr_to_stdout().run() {
                 Ok(output) => {
                     output_string.push_str(
                         String::from_utf8(output.stdout)
@@ -465,7 +465,7 @@ impl Target {
                     );
                 }
                 Err(e) => {
-                    println!("Error running \"{}\": {}", e, command);
+                    println!("Error running \"{}\": {}", command, e);
                     tx.send(BuildResult {
                         target: name,
                         state: BuildResultState::Fail,
@@ -488,7 +488,7 @@ impl Target {
 
     fn run(&self, rx: Receiver<RunSignal>) -> Result<(), String> {
         for command in self.run_list.iter() {
-            let handle = cmd!("/bin/sh", "-c", command)
+            let handle = cmd!("sh", "-c", command)
                 .stderr_to_stdout()
                 .start()
                 .map_err(|e| format!("Failed to run command {}: {}", command, e))?;
@@ -497,7 +497,7 @@ impl Target {
                     let kill_command = "kill ".to_owned() + &handle.pids().iter().map(|x| format!("{}", x))
                         .collect::<Vec<String>>()
                         .join(" ");
-                    cmd!("/bin/sh", "-c", kill_command).start().map_err(|e| {
+                    cmd!("sh", "-c", kill_command).start().map_err(|e| {
                         let result = format!("Failed to kill process {}: {}", command, e);
                         println!("{}", result);
                         result
