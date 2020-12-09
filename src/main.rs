@@ -157,7 +157,7 @@ impl<'a> ColorPicker<'a> {
                 Color::Rgb(156, 222, 214),
                 Color::Rgb(247, 156, 212),
             ],
-            color_index: 7,
+            color_index: 0,
         }
     }
 
