@@ -1,6 +1,6 @@
 [package]
 name = "buildy"
-version = "0.12.0"
+version = "0.12.1"
 authors = ["Steve Mostovoy <stevemostovoysm@gmail.com>"]
 edition = "2018"
 
@@ -17,9 +17,9 @@ repository = "https://github.com/stovoy/buildy"
 maintenance = { status = "actively-developed" }
 
 [dependencies]
-serde = { version = "1.0.110", features = ["derive"] }
-serde_yaml = "0.8.12"
-crossbeam = "0.7.3"
+serde = { version = "1.0.118", features = ["derive"] }
+serde_yaml = "0.8.14"
+crossbeam = "0.8.0"
 duct = "0.13.4"
 walkdir = "2.3.1"
 rust-crypto = "0.2.36"
