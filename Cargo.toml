@@ -1,6 +1,6 @@
 [package]
 name = "buildy"
-version = "0.11.0"
+version = "0.12.0"
 authors = ["Steve Mostovoy <stevemostovoysm@gmail.com>"]
 edition = "2018"
 
@@ -24,3 +24,4 @@ duct = "0.13.4"
 walkdir = "2.3.1"
 rust-crypto = "0.2.36"
 notify = "4.0.15"
+termcolor = "1.1.2"
