@@ -672,7 +672,7 @@ impl<'a> Target<'a> {
                             .map(|x| format!("{}", x))
                             .collect::<Vec<String>>()
                             .join(" ");
-                    if cmd!("sh", "-c", kill_command).run().is_err() {};
+                    if self.run_command(&kill_command, None).is_err() {};
                     break;
                 }
                 Err(e) => match e {
