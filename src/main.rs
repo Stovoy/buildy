@@ -9,12 +9,19 @@ use std::fmt;
 use std::fs;
 use std::io::{LineWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, SendError, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use walkdir::WalkDir;
+
+mod checksum;
+mod color;
+mod error;
+
+use crate::checksum::*;
+use crate::color::ColorPicker;
+use crate::error::{BuildLoopError, SanityCheckError};
 
 fn main() -> Result<(), String> {
     let file_name = ".buildy.yml";
@@ -46,64 +53,6 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-enum SanityCheckError<'a> {
-    DependencyNotFound(&'a str),
-    DependencyLoop(Vec<&'a str>),
-}
-
-impl fmt::Display for SanityCheckError<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SanityCheckError::DependencyNotFound(dependency) => {
-                write!(f, "Dependency {} not found.", dependency)
-            }
-            SanityCheckError::DependencyLoop(dependencies) => {
-                write!(f, "Dependency loop: [{}]", dependencies.join(", "))
-            }
-        }
-    }
-}
-
-enum BuildLoopError<'a> {
-    BuildFailed(&'a str),
-    UnspecifiedChannelError,
-    SendError(SendError<RunSignal>),
-    RecvError(TryRecvError),
-    WatcherSetupError(notify::Error),
-    WatcherPathError(&'a str, notify::Error),
-    CwdIOError(std::io::Error),
-    CwdUtf8Error,
-}
-
-impl fmt::Display for BuildLoopError<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BuildLoopError::BuildFailed(target) => write!(f, "Build failed for target {}", target),
-            BuildLoopError::UnspecifiedChannelError => {
-                write!(f, "Unknown channel parllelism failure")
-            }
-            BuildLoopError::SendError(send_err) => write!(
-                f,
-                "Failed to send run signal '{}' to running process",
-                send_err.0
-            ),
-            BuildLoopError::RecvError(recv_err) => {
-                write!(f, "Channel receive failure: {}", recv_err)
-            }
-            BuildLoopError::WatcherSetupError(notify_err) => {
-                write!(f, "Watcher setup error: {}", notify_err)
-            }
-            BuildLoopError::WatcherPathError(path, notify_err) => {
-                write!(f, "File watch error: {}: {}", path, notify_err)
-            }
-            BuildLoopError::CwdIOError(io_err) => {
-                write!(f, "IO Error while getting current directory: {}", io_err)
-            }
-            BuildLoopError::CwdUtf8Error => write!(f, "Current directory was not valid utf-8"),
-        }
-    }
-}
-
 struct BuildResult<'a> {
     target: &'a str,
     state: BuildResultState,
@@ -116,7 +65,7 @@ enum BuildResultState {
     Skip,
 }
 
-enum RunSignal {
+pub enum RunSignal {
     Kill,
 }
 
@@ -124,52 +73,6 @@ impl fmt::Display for RunSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RunSignal::Kill => write!(f, "KILL"),
-        }
-    }
-}
-
-struct ColorPicker<'a> {
-    color_map: HashMap<&'a str, usize>,
-    colors: Vec<Color>,
-    color_index: usize,
-}
-
-impl<'a> ColorPicker<'a> {
-    fn new() -> ColorPicker<'a> {
-        ColorPicker {
-            color_map: HashMap::new(),
-            colors: vec![
-                Color::Rgb(2, 63, 165),
-                Color::Rgb(125, 135, 185),
-                Color::Rgb(187, 119, 132),
-                Color::Rgb(142, 6, 59),
-                Color::Rgb(74, 111, 227),
-                Color::Rgb(133, 149, 225),
-                Color::Rgb(181, 187, 227),
-                Color::Rgb(230, 175, 185),
-                Color::Rgb(224, 123, 145),
-                Color::Rgb(211, 63, 106),
-                Color::Rgb(17, 198, 56),
-                Color::Rgb(141, 213, 147),
-                Color::Rgb(240, 185, 141),
-                Color::Rgb(239, 151, 8),
-                Color::Rgb(15, 207, 192),
-                Color::Rgb(156, 222, 214),
-                Color::Rgb(247, 156, 212),
-            ],
-            color_index: 0,
-        }
-    }
-
-    fn get(&mut self, name: &'a str) -> Color {
-        if self.color_map.contains_key(name) {
-            let index = *self.color_map.get(name).unwrap();
-            *self.colors.get(index).unwrap()
-        } else {
-            self.color_map.insert(name, self.color_index);
-            let old_color_index = self.color_index;
-            self.color_index = (self.color_index + 1) % self.colors.len();
-            *self.colors.get(old_color_index).unwrap()
         }
     }
 }
@@ -467,25 +370,6 @@ impl<'a> Builder<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize, Clone)]
-struct Target<'a> {
-    #[serde(default)]
-    depends_on: Vec<String>,
-    #[serde(default, rename = "watch")]
-    watch_list: Vec<String>,
-    #[serde(default, rename = "build")]
-    build_list: Vec<String>,
-    #[serde(default, rename = "run")]
-    run_list: Vec<String>,
-    #[serde(default)]
-    run_options: RunOptions,
-
-    #[serde(skip_deserializing)]
-    name: Option<&'a str>,
-    #[serde(skip_deserializing)]
-    color: Option<Color>,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -547,6 +431,25 @@ impl<'a> Write for StdoutColorPrefixWriter<'a> {
         // Nothing to do, this is instantly flushed.
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Deserialize, Clone)]
+struct Target<'a> {
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default, rename = "watch")]
+    watch_list: Vec<String>,
+    #[serde(default, rename = "build")]
+    build_list: Vec<String>,
+    #[serde(default, rename = "run")]
+    run_list: Vec<String>,
+    #[serde(default)]
+    run_options: RunOptions,
+
+    #[serde(skip_deserializing)]
+    name: Option<&'a str>,
+    #[serde(skip_deserializing)]
+    color: Option<Color>,
 }
 
 impl<'a> Target<'a> {
@@ -690,66 +593,4 @@ impl<'a> Target<'a> {
         let mut writer = StdoutColorPrefixWriter { color, line_prefix };
         writer.write_all(message.as_bytes()).unwrap();
     }
-}
-
-fn calculate_checksum(path: &str) -> Result<String, String> {
-    let mut hasher = Sha1::new();
-
-    for entry in WalkDir::new(path) {
-        let entry = entry.map_err(|e| format!("Failed to traverse directory: {}", e))?;
-
-        if entry.path().is_file() {
-            let entry_path = match entry.path().to_str() {
-                Some(s) => s,
-                None => return Err("Failed to convert file path into String".to_owned()),
-            };
-            let contents = fs::read(entry_path)
-                .map_err(|e| format!("Failed to read file to calculate checksum: {}", e))?;
-            hasher.input(contents.as_slice());
-        }
-    }
-    Ok(hasher.result_str())
-}
-
-const CHECKSUM_DIRECTORY: &str = ".buildy";
-
-fn checksum_file_name(target: &str) -> String {
-    format!("{}/{}.checksum", CHECKSUM_DIRECTORY, target)
-}
-
-fn does_checksum_match(target: &str, checksum: &str) -> Result<bool, String> {
-    // Might want to check for some errors like permission denied.
-    fs::create_dir(CHECKSUM_DIRECTORY).ok();
-    let file_name = checksum_file_name(target);
-    match fs::read_to_string(&file_name) {
-        Ok(old_checksum) => Ok(*checksum == old_checksum),
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // No checksum found.
-                Ok(false)
-            } else {
-                Err(format!(
-                    "Failed reading checksum file {} for target {}: {}",
-                    file_name, target, e
-                ))
-            }
-        }
-    }
-}
-
-fn write_checksum(target: &str, checksum: &str) -> Result<(), String> {
-    let file_name = checksum_file_name(target);
-    let mut file = fs::File::create(&file_name).map_err(|_| {
-        format!(
-            "Failed to create checksum file {} for target {}",
-            file_name, target
-        )
-    })?;
-    file.write_all(checksum.as_bytes()).map_err(|_| {
-        format!(
-            "Failed to write checksum file {} for target {}",
-            file_name, target
-        )
-    })?;
-    Ok(())
 }

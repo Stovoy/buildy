@@ -1,0 +1,7 @@
+build:
+  watch:
+    - src/
+    - Cargo.lock
+    - Cargo.toml
+  build:
+    - cargo build --release && cargo clippy && cargo fmt
